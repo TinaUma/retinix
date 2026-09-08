@@ -175,4 +175,15 @@ Always respond in the user's language.
 - Save useful patterns to project memory
 
 <!-- DYNAMIC:START -->
+## Current State
+Session: #1 (active) | Branch: main | Version: 1.8.0
+Tasks: 0/1 done, 1 active, 0 blocked
+Active: retinix-landing-visual-v4
+
+### Memory tail
+Context (1):
+- #1 retinix-landing-ключевые-пути
+Conventions (2):
+- #4 retinix-клиент-предпочтения
+- #2 retinix-landing-дизайн-решения
 <!-- DYNAMIC:END -->
