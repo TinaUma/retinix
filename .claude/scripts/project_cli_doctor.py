@@ -1,0 +1,471 @@
+"""TAUSIK CLI handler for `tausik doctor` — health diagnostic.
+
+Single-pass check: venv + DB + MCP servers + core skills + bootstrap drift +
+session capacity + gates loadable. Surfaces actionable next steps for any FAIL.
+Exit code 0 on all-clean, 1 on any FAIL (so CI can gate on it).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Mapping
+from typing import Any
+
+from project_service import ProjectService
+
+_CI_ENV_MARKERS = frozenset(
+    {
+        "CI",
+        "CONTINUOUS_INTEGRATION",
+        "GITHUB_ACTIONS",
+        "GITLAB_CI",
+        "BUILDKITE",
+        "CIRCLECI",
+        "TF_BUILD",
+        "JENKINS_URL",
+        "TRAVIS",
+    }
+)
+
+
+def _env_truthy(environ: Mapping[str, str], key: str) -> bool:
+    val = environ.get(key)
+    if val is None:
+        return False
+    return str(val).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def looks_like_ci_environment(environ: Mapping[str, str]) -> bool:
+    """True when common CI/CD vars suggest an automated runner (not local IDE)."""
+
+    return any(_env_truthy(environ, k) for k in _CI_ENV_MARKERS)
+
+
+def auto_verify_interactive_warning_detail(
+    cfg: dict,
+    environ: Mapping[str, str],
+) -> str | None:
+    """Warning text when legacy inline verify is enabled outside CI; else None."""
+
+    td_raw = cfg.get("task_done")
+    td = td_raw if isinstance(td_raw, dict) else {}
+    if not bool(td.get("auto_verify")):
+        return None
+    if looks_like_ci_environment(environ):
+        return None
+    return (
+        "task_done.auto_verify=true — heavy gates inline on `task done` (legacy). "
+        "Prefer `verify` then `task done` for interactive agents; CI may keep "
+        "`auto_verify` for single-step pipelines."
+    )
+
+
+def _supports_utf8() -> bool:
+    if sys.platform == "win32":
+        if os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM"):
+            return True
+        try:
+            import ctypes
+
+            cp = ctypes.windll.kernel32.GetConsoleOutputCP()
+            return bool(cp == 65001)
+        except Exception:  # noqa: BLE001 — best-effort: non-fatal, keeps the surrounding flow alive
+            return False
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    return "utf" in enc
+
+
+GREEN = "✓" if _supports_utf8() else "OK"
+YELLOW = "!" if _supports_utf8() else "WARN"
+RED = "✗" if _supports_utf8() else "FAIL"
+
+_DB_PRE_SVC_EXISTS: bool | None = None
+
+
+def _capture_db_state() -> None:
+    """Snapshot DB existence BEFORE get_service auto-creates it."""
+    global _DB_PRE_SVC_EXISTS
+    if _DB_PRE_SVC_EXISTS is None:
+        db = os.path.join(os.getcwd(), ".tausik", "tausik.db")
+        _DB_PRE_SVC_EXISTS = os.path.isfile(db)
+
+
+def cmd_doctor(svc: ProjectService, args: Any) -> None:
+    failures = 0
+    warnings = 0
+    project_dir = os.getcwd()
+
+    print("TAUSIK doctor — health check")
+    print("=" * 40)
+
+    venv_dir = os.path.join(project_dir, ".tausik", "venv")
+    if os.path.isdir(venv_dir):
+        _print_ok("Python venv", venv_dir)
+    else:
+        _print_fail(
+            "Python venv",
+            "not found at .tausik/venv — run: python bootstrap/bootstrap.py",
+        )
+        failures += 1
+
+    db = os.path.join(project_dir, ".tausik", "tausik.db")
+    if _DB_PRE_SVC_EXISTS is False:
+        _print_warn(
+            "Project DB",
+            "was MISSING before doctor — auto-created. Run: tausik init for full setup",
+        )
+        warnings += 1
+    elif os.path.isfile(db):
+        size_kb = os.path.getsize(db) // 1024
+        _print_ok("Project DB", f".tausik/tausik.db ({size_kb} KB)")
+    else:
+        _print_fail("Project DB", "not found — run: tausik init")
+        failures += 1
+
+    # Which profile directory this project actually runs from. Hardcoding
+    # `.claude` here made `doctor` FAIL and exit 1 on every Cursor / Qwen /
+    # Kilo / OpenCode install — bootstrap deploys `.cursor/mcp`, `.qwen/mcp`
+    # and friends, and the health check declared them missing. A health check
+    # that fails healthy projects trains people to ignore it.
+    from ide_utils import missing_profile_hint, resolve_profile
+
+    ide, ide_rel = resolve_profile(project_dir)
+    mcp_project = os.path.join(project_dir, ide_rel, "mcp", "project", "server.py")
+    mcp_brain = os.path.join(project_dir, ide_rel, "mcp", "brain", "server.py")
+    if os.path.isfile(mcp_project):
+        _print_ok("MCP server (project)", f"{ide_rel}/mcp/project/server.py")
+    else:
+        hint = missing_profile_hint(project_dir, ide)
+        _print_fail("MCP server (project)", f"{ide_rel}/mcp/project/server.py {hint}")
+        failures += 1
+    if os.path.isfile(mcp_brain):
+        _print_ok("MCP server (brain)", f"{ide_rel}/mcp/brain/server.py")
+    else:
+        _print_warn("MCP server (brain)", "missing — bootstrap may have skipped it")
+        warnings += 1
+
+    # Kilo MCP config — only fires for Kilo installs (.kilo/.kilocode present).
+    # Silent for non-Kilo projects so it adds no noise to the common path.
+    try:
+        from service_doctor_kilo import check_kilo_config
+
+        for severity, label, detail in check_kilo_config(project_dir):
+            if severity == "fail":
+                _print_fail(label, detail)
+                failures += 1
+            elif severity == "warn":
+                _print_warn(label, detail)
+                warnings += 1
+            else:
+                _print_ok(label, detail)
+    except Exception as e:  # noqa: BLE001 — best-effort: a Kilo-check bug must not crash doctor
+        _print_warn("Kilo MCP config", f"could not validate: {e}")
+        warnings += 1
+
+    # OpenCode config + QG-0 plugin — only fires for OpenCode installs (.opencode/).
+    # Catches the three failures that broke a user's host: a `tools` object
+    # (ConfigInvalidError), a missing/singular-dir plugin (enforcement silently off),
+    # and `instructions` pointing nowhere (rules silently never load).
+    try:
+        from service_doctor_opencode import check_opencode_config
+
+        for severity, label, detail in check_opencode_config(project_dir):
+            if severity == "fail":
+                _print_fail(label, detail)
+                failures += 1
+            elif severity == "warn":
+                _print_warn(label, detail)
+                warnings += 1
+            else:
+                _print_ok(label, detail)
+    except Exception as e:  # noqa: BLE001 — best-effort: a check bug must not crash doctor
+        _print_warn("OpenCode config", f"could not validate: {e}")
+        warnings += 1
+
+    # caveman interop — silent unless a user-installed caveman is present alongside
+    # TAUSIK's own output_mode. Surfaces coexistence + the .claude/settings.json overlap.
+    try:
+        from service_doctor_caveman import check_caveman_interop
+
+        for severity, label, detail in check_caveman_interop(project_dir):
+            if severity == "warn":
+                _print_warn(label, detail)
+                warnings += 1
+            else:
+                _print_ok(label, detail)
+    except Exception as e:  # noqa: BLE001 — best-effort: a check bug must not crash doctor
+        _print_warn("caveman interop", f"could not validate: {e}")
+        warnings += 1
+
+    # Backlog hygiene — open tasks no epic can reach. The release boundary is a
+    # mechanical "everything in epic X", so such a task is silently absent from
+    # every scope count. Warn, never fail: a standalone task is legitimate.
+    # Deferred AC — a criterion parked at closure inside work still in flight.
+    # Scoped to open epics so the signal stays clearable; a warning that names
+    # long-shipped history is one a reader learns to skip.
+    try:
+        from service_doctor_backlog import check_backlog_hygiene, check_deferred_acs
+
+        for check in (check_backlog_hygiene, check_deferred_acs):
+            for severity, label, detail in check(svc):
+                if severity == "warn":
+                    _print_warn(label, detail)
+                    warnings += 1
+                else:
+                    _print_ok(label, detail)
+    except Exception as e:  # noqa: BLE001 — best-effort: a check bug must not crash doctor
+        _print_warn("Backlog hygiene", f"could not validate: {e}")
+        warnings += 1
+
+    skills_dir = os.path.join(project_dir, ide_rel, "skills")
+    if os.path.isdir(skills_dir):
+        skills = [d for d in os.listdir(skills_dir) if os.path.isdir(os.path.join(skills_dir, d))]
+        critical = {
+            "start",
+            "end",
+            "task",
+            "plan",
+            "review",
+            "ship",
+            "checkpoint",
+        }
+        brain_critical, brain_undetermined = brain_skill_requirement()
+        if brain_critical:
+            critical.add("brain")
+        missing = critical - set(skills)
+        if not missing:
+            _print_ok("Core skills", f"{len(skills)} deployed (all critical present)")
+        else:
+            _print_fail(
+                "Core skills",
+                f"missing critical: {sorted(missing)} — re-run bootstrap",
+            )
+            failures += 1
+        if brain_undetermined:
+            # A WARNING, never a failure. Inserting this block above once stole
+            # the `failures += 1` that belonged to the branch overhead — which
+            # both stopped missing critical skills from failing the check AND
+            # made an unreadable config fail it, the exact inversion of what the
+            # message right here promises. Counting stays with the FAIL branch.
+            _print_warn(
+                "Shared Brain",
+                "config unreadable — could not tell whether brain is enabled. "
+                "Treating it as OFF (the default), so this does not fail the check. "
+                "If you do use the Notion brain, fix .tausik/config.json and re-run.",
+            )
+    else:
+        _print_fail("Core skills", f"no {ide_rel}/skills/ — run bootstrap")
+        failures += 1
+
+    drift_names = _scripts_drift_names(project_dir)
+    if drift_names is None:
+        _print_warn("Bootstrap drift", "could not compare scripts/ vs deployed profiles")
+        warnings += 1
+    elif drift_names:
+        shown = ", ".join(drift_names[:8])
+        more = f" (+{len(drift_names) - 8} more)" if len(drift_names) > 8 else ""
+        _print_warn(
+            "Bootstrap drift",
+            f"{len(drift_names)} deployed file(s) differ: {shown}{more} — "
+            "run `python bootstrap/bootstrap.py --ide all` to redeploy",
+        )
+        warnings += 1
+    else:
+        _print_ok("Bootstrap drift", "none — deployed scripts match source")
+
+    md_is_warn, md_detail = _format_claudemd_drift_line(_claudemd_drift_report(project_dir))
+    if md_is_warn:
+        _print_warn("CLAUDE.md drift", md_detail)
+        warnings += 1
+    else:
+        _print_ok("CLAUDE.md drift", md_detail)
+
+    try:
+        from project_config import (
+            DEFAULT_SESSION_CAPACITY_CALLS,
+            DEFAULT_SESSION_IDLE_THRESHOLD_MINUTES,
+            DEFAULT_SESSION_MAX_MINUTES,
+            DEFAULT_SESSION_WARN_THRESHOLD_MINUTES,
+            load_config_with_rejections,
+        )
+        from verify_constants import DEFAULT_CACHE_TTL_S
+
+        cfg, trust_rejections = load_config_with_rejections()
+        cap = cfg.get("session_capacity_calls", DEFAULT_SESSION_CAPACITY_CALLS)
+        # DELIBERATELY the configured base, not the extended limit `tausik status`
+        # shows. This line reports CONFIGURATION, not the state of whichever
+        # session happens to be open — a `session extend` is a fact about one
+        # session, and folding it in here would make doctor describe a knob nobody
+        # set. The divergence from `status` is intended; do not "fix" it.
+        max_min = cfg.get("session_max_minutes", DEFAULT_SESSION_MAX_MINUTES)
+        warn_th = cfg.get("session_warn_threshold_minutes", DEFAULT_SESSION_WARN_THRESHOLD_MINUTES)
+        idle_th = cfg.get("session_idle_threshold_minutes", DEFAULT_SESSION_IDLE_THRESHOLD_MINUTES)
+        ttl = cfg.get("verify_cache_ttl_seconds", DEFAULT_CACHE_TTL_S)
+        _print_ok(
+            "Config knobs",
+            f"max={max_min}m warn={warn_th}m idle={idle_th}m capacity={cap} cache_ttl={ttl}s",
+        )
+        av_hint = auto_verify_interactive_warning_detail(cfg, dict(os.environ))
+        if av_hint:
+            _print_warn("Verify-First profile", av_hint)
+            warnings += 1
+        # Trust tiers: a project-scope key that tried to weaken enforcement is
+        # dropped on read. Silent dropping would look like the setting works,
+        # so every rejection is named here.
+        if trust_rejections:
+            for r in trust_rejections:
+                _print_warn("Config trust tier", r.describe())
+            warnings += len(trust_rejections)
+        else:
+            _print_ok("Config trust tier", "no project-scope key weakens enforcement")
+    except Exception as e:  # noqa: BLE001 — best-effort: non-fatal, keeps the surrounding flow alive
+        _print_warn("Config knobs", f"load failed: {e}")
+        warnings += 1
+
+    try:
+        from default_gates import DEFAULT_GATES
+
+        gate_names = sorted(DEFAULT_GATES.keys())
+        # Resolve the gates the project will ACTUALLY run, not just the registry
+        # count. Counting DEFAULT_GATES alone cannot fail, so it reported a
+        # clean bill of health while a malformed `gates` entry crashed
+        # `load_gates` and silently disabled Verify-First enforcement.
+        from project_config import get_gates_for_trigger, load_gates
+
+        effective = load_gates()
+        verify_gates = get_gates_for_trigger("verify")
+        _print_ok(
+            "Quality gates",
+            f"{len(gate_names)} registered, {len(effective)} resolved, "
+            f"{len(verify_gates)} on verify",
+        )
+    except Exception as e:  # noqa: BLE001 — a gate config that cannot resolve is a FAIL, not a warning
+        _print_fail("Quality gates", f"config failed to resolve: {type(e).__name__}: {e}")
+        failures += 1
+
+    # Brain config — surfaces "enabled but misconfigured" before the user
+    # accumulates local-only decisions/gotchas that should reach Notion.
+    # See defect v14b-defect-brain-decisions-empty.
+    try:
+        from brain_config import is_brain_enabled, validate_brain
+
+        if is_brain_enabled():
+            brain_errors = validate_brain()
+            if brain_errors:
+                first = brain_errors[0]
+                more = f" (+{len(brain_errors) - 1} more)" if len(brain_errors) > 1 else ""
+                _print_warn(
+                    "Brain config",
+                    f"enabled but misconfigured: {first}{more} — "
+                    f"run `tausik brain init` or set `brain.enabled=false`",
+                )
+                warnings += 1
+            else:
+                _print_ok("Brain config", "enabled, all 4 database_ids + token set")
+        else:
+            _print_ok("Brain config", "disabled (opt-in)")
+    except Exception as e:  # noqa: BLE001 — best-effort: non-fatal, keeps the surrounding flow alive
+        _print_warn("Brain config", f"could not validate: {e}")
+        warnings += 1
+
+    try:
+        active = svc.session_active_minutes()
+        wall = svc.session_wall_minutes()
+        if wall > 0:
+            _print_ok("Session", f"{active}m active / {wall}m wall")
+        else:
+            _print_ok("Session", "no active session")
+    except Exception as e:  # noqa: BLE001 — best-effort: non-fatal, keeps the surrounding flow alive
+        _print_warn("Session", f"could not read: {e}")
+        warnings += 1
+
+    print("=" * 40)
+    if failures:
+        print(f"{RED} {failures} FAIL, {warnings} WARN — fix above before running tasks.")
+        sys.exit(1)
+    elif warnings:
+        print(f"{YELLOW} OK with {warnings} warning(s).")
+    else:
+        print(f"{GREEN} All clean.")
+
+
+def _print_ok(label: str, detail: str) -> None:
+    print(f"  {GREEN}  {label:<25} {detail}")
+
+
+def brain_skill_requirement() -> tuple[bool, bool]:
+    """(is_critical, undetermined) — is the opt-in brain skill required here?
+
+    Required only when `brain.enabled` is true. The rule lives here, in one
+    readable place, rather than inside `cmd_doctor` — which is how the
+    contradiction described below survived: a branch nine lines under the
+    comment that forbids it is far enough that nobody read them together, and
+    buried mid-function it was not testable either.
+
+    WHAT THE OLD BRANCH ACTUALLY DID. It added the brain skill to the critical
+    set when the config could not be loaded — "default-on when config
+    unreadable" — turning an OPT-IN subsystem into a required one. Two things
+    are worth stating precisely, because an earlier version of this docstring
+    got the second one wrong and review caught it.
+
+    First: it was a real inversion. Uncertainty must not manufacture a
+    requirement, and `enabled` defaults to False, so following the default is
+    the only reading consistent with the rest of the config layer.
+
+    Second, and contrary to what this docstring first claimed: a fresh project
+    with no config NEVER reached that branch. `load_config` already swallows a
+    missing or malformed file, prints "Config corrupted — using defaults", and
+    returns `{}`. So the except path fires only on unusual failures — an import
+    error, a filesystem fault — and the story about new projects failing their
+    health check was invented, not observed.
+
+    WHY EVERYTHING IS INSIDE THE TRY. The return used to sit outside it, and
+    that was a regression this very fix introduced: `{"brain": true}` — an
+    ordinary typo, valid JSON, no exception from `load_config` — made
+    `.get()` raise AttributeError out of a call `cmd_doctor` does not guard,
+    crashing the whole health check. A doctor that dies on a malformed config is
+    worse than one that misjudges it, because it reports nothing at all.
+
+    The second return value exists so the caller SAYS it could not tell: an
+    undetermined check that reports nothing is indistinguishable from one that
+    passed, and that is how a check quietly stops existing.
+    """
+    try:
+        from project_config import load_config  # noqa: PLC0415
+
+        cfg = load_config() or {}
+        brain = cfg.get("brain")
+        if not isinstance(brain, dict):
+            # Present but not a mapping — `{"brain": true}` and friends. Not an
+            # opt-in, and not a crash: treat it as off and say we could not tell.
+            return False, brain is not None
+        return bool(brain.get("enabled", False)), False
+    except Exception:  # noqa: BLE001 — best-effort: non-fatal, keeps the surrounding flow alive
+        return False, True
+
+
+def _print_warn(label: str, detail: str) -> None:
+    print(f"  {YELLOW}  {label:<25} {detail}")
+
+
+def _print_fail(label: str, detail: str) -> None:
+    print(f"  {RED}  {label:<25} {detail}")
+
+
+# Drift checks moved to service_doctor_drift.py (filesize gate). Re-exported
+# here under the legacy underscore-prefixed names so existing tests + callers
+# continue to work without import surgery.
+from service_doctor_drift import (  # noqa: E402,F401
+    check_claudemd_drift as _check_claudemd_drift,
+    check_scripts_drift as _check_scripts_drift,
+    claudemd_drift_report as _claudemd_drift_report,
+    format_claudemd_drift_line as _format_claudemd_drift_line,
+    scripts_drift_names as _scripts_drift_names,
+)
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via subprocess in tests
+    from cli_entrypoint import refuse_direct_run
+
+    refuse_direct_run(__file__)

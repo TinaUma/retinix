@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Parse Claude Code transcript JSONL and extract session metrics.
+
+Reads a conversation transcript (JSONL), sums token usage from API responses,
+computes estimated cost, and writes results to .claude-project/session-metrics.json.
+
+Usage:
+    python scripts/hooks/session_metrics.py <transcript_path>
+    python scripts/hooks/session_metrics.py --session-dir <dir>  # latest .jsonl
+
+Can be used as a Claude Code hook (PostSessionEnd) or called from /end skill.
+"""
+
+import json
+import os
+import sys
+from glob import glob
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from cost_pricing import calculate_cost_usd  # noqa: E402
+from token_accounting import sum_usage_tokens  # noqa: E402
+
+
+def parse_transcript(path: str) -> dict:
+    """Parse JSONL transcript and extract metrics.
+
+    Returns:
+        {tokens_input, tokens_output, tokens_total, cost_usd,
+         tool_calls, model, messages, duration_sec}
+    """
+    tokens_input = 0
+    tokens_output = 0
+    tool_calls = 0
+    model = ""
+    messages = 0
+    first_ts = None
+    last_ts = None
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            # Extract timestamp
+            ts = entry.get("timestamp")
+            if ts:
+                if first_ts is None:
+                    first_ts = ts
+                last_ts = ts
+
+            # Count messages
+            msg_type = entry.get("type", "")
+            if msg_type in ("human", "assistant"):
+                messages += 1
+
+            # Extract usage from API response. sum_usage_tokens folds in
+            # server-side compaction billed under usage.iterations[*], which the
+            # top-level input/output_tokens omit — a top-level-only sum here
+            # understated the real (billed) token count (l26-tokenizer-calibration).
+            usage = entry.get("usage") or entry.get("message", {}).get("usage") or {}
+            if usage:
+                ti, to = sum_usage_tokens(usage)
+                tokens_input += ti
+                tokens_output += to
+
+            # Extract model
+            entry_model = entry.get("model") or entry.get("message", {}).get("model") or ""
+            if entry_model and not model:
+                model = entry_model
+
+            # Count tool use
+            content = entry.get("content") or entry.get("message", {}).get("content") or []
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_calls += 1
+
+    tokens_total = tokens_input + tokens_output
+
+    if not model:
+        # No silent Opus fallback — Sonnet/Haiku transcripts would be 5×–19×
+        # over-attributed. Emit a stderr warning (parity with posttool_usage)
+        # and report cost_usd=0.0 so downstream telemetry can flag the gap.
+        if tokens_total > 0:
+            print(
+                "session_metrics: transcript missing 'model' field; "
+                f"reporting cost_usd=0.0 for {tokens_total} tokens",
+                file=sys.stderr,
+            )
+        cost_usd = 0.0
+    else:
+        cost_usd = calculate_cost_usd(model, tokens_input, tokens_output)
+
+    # Duration
+    duration_sec = 0
+    if first_ts and last_ts:
+        try:
+            from datetime import datetime
+
+            t1 = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            t2 = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            duration_sec = int((t2 - t1).total_seconds())
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "tokens_input": tokens_input,
+        "tokens_output": tokens_output,
+        "tokens_total": tokens_total,
+        "cost_usd": round(cost_usd, 4),
+        "tool_calls": tool_calls,
+        "model": model,
+        "messages": messages,
+        "duration_sec": duration_sec,
+    }
+
+
+def find_latest_transcript(session_dir: str) -> str | None:
+    """Find the most recent .jsonl transcript in a directory."""
+    pattern = os.path.join(session_dir, "*.jsonl")
+    files = sorted(glob(pattern), key=os.path.getmtime, reverse=True)
+    return files[0] if files else None
+
+
+def auto_find_transcript() -> str | None:
+    """Auto-detect Claude Code transcript for current project.
+
+    Checks ~/.claude/projects/<project-slug>/*.jsonl
+    Project slug is derived from CWD by replacing path separators with dashes.
+    """
+
+    def _auto_find_in_projects_root(projects_dir: str) -> str | None:
+        if not os.path.isdir(projects_dir):
+            return None
+        # Build slug from CWD (shared across IDEs: path separators -> dashes)
+        cwd = os.getcwd()
+        cwd_normalized = cwd.replace("\\", "/").replace(":", "")
+        slug_candidate = cwd_normalized.replace("/", "-")
+
+        # Search for matching directory first
+        for entry in os.listdir(projects_dir):
+            entry_lower = entry.lower()
+            if slug_candidate.lower() in entry_lower or entry_lower in slug_candidate.lower():
+                project_dir = os.path.join(projects_dir, entry)
+                if os.path.isdir(project_dir):
+                    t = find_latest_transcript(project_dir)
+                    if t:
+                        return t
+
+        # Fallback: most recent transcript in this projects root
+        all_transcripts: list[str] = []
+        for entry in os.listdir(projects_dir):
+            project_dir = os.path.join(projects_dir, entry)
+            if os.path.isdir(project_dir):
+                t = find_latest_transcript(project_dir)
+                if t:
+                    all_transcripts.append(t)
+        if all_transcripts:
+            return max(all_transcripts, key=os.path.getmtime)
+        return None
+
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, ".claude", "projects"),
+        os.path.join(home, ".cursor", "projects"),
+    ]
+    for projects_dir in candidates:
+        found = _auto_find_in_projects_root(projects_dir)
+        if found:
+            return found
+    return None
+
+
+def write_metrics(metrics: dict, output_path: str | None = None) -> str:
+    """Write metrics to JSON file. Returns path written."""
+    if not output_path:
+        output_path = os.path.join(os.getcwd(), ".claude-project", "session-metrics.json")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+    return output_path
+
+
+def _load_config_safe() -> dict | None:
+    """Effective project config, or None. Best-effort — never raises."""
+    try:
+        from project_config import load_config
+
+        return load_config()
+    except Exception:  # noqa: BLE001 — no config just means "export stays off"
+        return None
+
+
+# Token-row extraction and the token_metrics.jsonl writer moved to
+# `token_rows` at the 400-line cap. Re-exported so existing callers and
+# tests keep importing them from here.
+from token_rows import (  # noqa: E402,F401
+    TOKEN_METRICS_MAX_BYTES,
+    _surviving_lines,
+    extract_token_rows,
+    replace_session_token_rows,
+)
+
+
+def resolve_session_id(project_dir: str | None = None) -> int | None:
+    """Most-recent session id from .tausik/tausik.db. None when DB missing/empty."""
+    proj = project_dir or os.getcwd()
+    db = os.path.join(proj, ".tausik", "tausik.db")
+    if not os.path.exists(db):
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(db, timeout=2)
+        try:
+            row = conn.execute("SELECT id FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
+            return int(row[0]) if row else None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def record_to_db(metrics: dict, project_root: str | None = None) -> bool:
+    """Call project.py metrics record-session to write metrics to CouchDB.
+
+    Returns True on success, False on failure.
+    """
+    import subprocess
+
+    # Locate project.py and the true project root by self-location, not a
+    # miscounted dirname chain. `dirname×3(__file__)` actually yielded the
+    # *profile* dir (…/.claude), so the old first candidate
+    # `<profile>/.claude/scripts/project.py` doubled the profile segment and
+    # never existed, and `cwd=<profile>` made project.py resolve `.tausik/`
+    # under the profile instead of the project root — a silent DB-record miss
+    # that only "worked" through the scripts/ fallback. The shared helper is
+    # the single home for this logic (see _common.profile_dir).
+    hooks_dir = os.path.dirname(os.path.abspath(__file__))
+    if hooks_dir not in sys.path:
+        sys.path.insert(0, hooks_dir)
+    from _common import profile_dir
+    from _common import project_root as _detect_root
+
+    profile = profile_dir()
+    if not project_root:
+        project_root = _detect_root()
+
+    candidates: list[str] = []
+    if profile:  # deployed: project.py ships under the profile's scripts/
+        candidates.append(os.path.join(profile, "scripts", "project.py"))
+    candidates.append(os.path.join(project_root, "scripts", "project.py"))  # source tree
+    script = next((c for c in candidates if os.path.isfile(c)), None)
+    if not script:
+        print("project.py not found, skipping DB record", file=sys.stderr)
+        return False
+
+    cmd = [
+        sys.executable,
+        script,
+        "metrics",
+        "record-session",
+        "--tokens-input",
+        str(metrics.get("tokens_input", 0)),
+        "--tokens-output",
+        str(metrics.get("tokens_output", 0)),
+        "--tokens-total",
+        str(metrics.get("tokens_total", 0)),
+        "--cost-usd",
+        str(metrics.get("cost_usd", 0.0)),
+        "--tool-calls",
+        str(metrics.get("tool_calls", 0)),
+        "--model",
+        metrics.get("model", ""),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=project_root,
+        )
+        if result.returncode == 0:
+            print(f"DB: {result.stdout.strip()}")
+            return True
+        else:
+            print(f"DB record failed: {result.stderr.strip()}", file=sys.stderr)
+            return False
+    except Exception as e:  # noqa: BLE001 — best-effort: a hook must never break the tool call it guards
+        print(f"DB record error: {e}", file=sys.stderr)
+        return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: session_metrics.py <transcript.jsonl>", file=sys.stderr)
+        print("       session_metrics.py --session-dir <dir>", file=sys.stderr)
+        print("       session_metrics.py --auto", file=sys.stderr)
+        print("  --record  Also write metrics to DB via project.py", file=sys.stderr)
+        sys.exit(1)
+
+    record = "--record" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--record"]
+
+    if not args:
+        print("Error: no transcript path provided", file=sys.stderr)
+        sys.exit(1)
+
+    path = None
+    if args[0] == "--auto":
+        path = auto_find_transcript()
+        if not path:
+            print("No transcript found (--auto). Skipping metrics.", file=sys.stderr)
+            sys.exit(0)
+    elif args[0] == "--session-dir":
+        if len(args) < 2:
+            print("Error: --session-dir requires a path", file=sys.stderr)
+            sys.exit(1)
+        path = find_latest_transcript(args[1])
+        if not path:
+            print(f"No .jsonl files found in {args[1]}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        path = args[0]
+
+    if not path or not os.path.isfile(path):
+        print(f"File not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    metrics = parse_transcript(path)
+    output = write_metrics(metrics)
+    print(
+        f"Metrics: {metrics['tokens_total']:,} tokens, ${metrics['cost_usd']:.2f}, "
+        f"{metrics['tool_calls']} tool calls, model={metrics['model']}"
+    )
+    print(f"Written to: {output}")
+
+    # Optional OTLP/JSON export — an ADDITIONAL output, off unless enabled. When
+    # disabled session_otlp_document() returns {} and nothing here runs, so the
+    # events/metrics path above is unchanged (l26-otel-export, AC1).
+    from otel_export import session_otlp_document
+
+    otlp = session_otlp_document(metrics, _load_config_safe())
+    if otlp:
+        otlp_path = os.path.join(os.path.dirname(output), "session-otlp.json")
+        with open(otlp_path, "w", encoding="utf-8") as f:
+            json.dump(otlp, f, indent=2, ensure_ascii=False)
+        print(f"OTLP trace: {otlp_path}")
+
+    if record:
+        record_to_db(metrics)
+
+    sid = resolve_session_id()
+    if sid is not None:
+        rows = extract_token_rows(path, sid)
+        jsonl = replace_session_token_rows(rows)
+        if jsonl:
+            print(f"token_metrics.jsonl: appended {len(rows)} row(s) to {jsonl}")
+
+
+if __name__ == "__main__":
+    main()

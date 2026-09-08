@@ -1,0 +1,17 @@
+# TAUSIK runtime — не коммитим БД и виртуальное окружение
+.tausik/
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
