@@ -486,6 +486,19 @@ html,body{background:#FAFEFF!important}
 #cta a[style*="color:inherit"]{color:var(--tl)!important}
 /* ── v11.19 CTA contacts: spread across full width ── */
 #cta [style*="border-top:1px solid var(--bd)"]{justify-content:space-between!important;gap:0!important}
+/* ── v11.20 CTA: bigger QR + contacts full-width align ── */
+
+/* QR code — bigger */
+#cta .qb img{width:210px!important;height:210px!important;display:block}
+#cta .qb{padding:16px!important;border-radius:14px!important}
+
+/* Contacts row — fill full width of text column */
+#cta [style*="border-top:1px solid var(--bd)"]{
+  width:100%!important;
+  justify-content:space-between!important;
+  gap:0!important;
+  box-sizing:border-box!important
+}
 </style>
 </head>
 <body>
