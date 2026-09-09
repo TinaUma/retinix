@@ -554,7 +554,12 @@ nav nav{background:transparent!important;border:none!important}
 .nv-link{background:none!important;padding:4px 0!important;border:none!important;box-shadow:none!important}
 /* v11.27 — nav 100px, hero air */
 nav{min-height:100px!important;padding:15px 0!important}
-#hero{padding-top:40px!important}</style>
+#hero{padding-top:40px!important}
+/* v11.28 — roadmap uniform: same dot size, same label color */
+#roadmap .ry{color:var(--ac)!important}
+#roadmap .rd{width:14px!important;height:14px!important;min-width:14px!important;border-width:2px!important}
+#roadmap .ri.now .rd,#roadmap .ri .rd{width:14px!important;height:14px!important}
+.rnow{display:none!important}</style>
 </head>
 <body>
 
@@ -996,10 +1001,10 @@ nav{min-height:100px!important;padding:15px 0!important}
     <div class="sl">Дорожная карта</div>
     <h2 class="st">Дорожная карта</h2>
     <div class="rm" style="grid-template-columns:repeat(3,1fr)">
-      <div class="ri now">
+      <div class="ri">
         <div class="rd"></div>
-        <div style="margin-bottom:6px"><span class="rnow">2026 — сейчас</span></div>
-        <div class="ry" style="font-size:.82rem;font-weight:800;color:var(--ac);letter-spacing:.04em">FOCUS</div>
+        
+        <div class="ry" style="font-size:.82rem;font-weight:800;color:var(--ac);letter-spacing:.04em;margin-bottom:6px">FOCUS</div>
         <h4 style="font-size:1rem;margin-bottom:8px">2026</h4>
         <ul style="font-size:.82rem;color:var(--tl2);line-height:1.7;padding-left:15px;margin:0">
           <li>Pro-версия ВМД</li>
