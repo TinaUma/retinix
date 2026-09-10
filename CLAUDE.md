@@ -176,14 +176,18 @@ Always respond in the user's language.
 
 <!-- DYNAMIC:START -->
 ## Current State
-Session: #1 (active) | Branch: main | Version: 1.8.0
-Tasks: 0/1 done, 1 active, 0 blocked
-Active: retinix-landing-visual-v4
+Session: none | Branch: main | Version: 1.8.0
+Tasks: 1/2 done, 1 active, 0 blocked
+Active: retinix-landing-blocks-v6
 
 ### Memory tail
-Context (1):
+Context (4):
+- #8 tech-debt-modals
+- #7 retinix-landing-v8-state
+- #5 retinix-landing-v6-state
 - #1 retinix-landing-ключевые-пути
-Conventions (2):
+Conventions (3):
+- #6 retinix-landing-нарратив-и-тон
 - #4 retinix-клиент-предпочтения
 - #2 retinix-landing-дизайн-решения
 <!-- DYNAMIC:END -->
